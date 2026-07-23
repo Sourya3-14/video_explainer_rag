@@ -2,3 +2,9 @@
 .env
 lancedb
 content
+.venv
+node_modules
+__pycache__
+__init__.py
+uploads
+vector_store
