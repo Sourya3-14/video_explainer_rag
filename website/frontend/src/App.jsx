@@ -1,5 +1,4 @@
-import React, { useEffect, useState } from "react";
-import axios from "axios";
+import React, { useEffect, useState, useRef } from "react";
 import { GoogleLogin, googleLogout } from "@react-oauth/google";
 import {
   FiChevronLeft,
@@ -14,6 +13,15 @@ import {
   FiLock,
 } from "react-icons/fi";
 import { FcGoogle } from "react-icons/fc";
+
+import {
+  setAuthToken,
+  getSessionVideoUrl,
+  loginWithGoogle,
+  fetchSessions,
+  createSession,
+  sendMessage,
+} from "./api";
 
 const STORAGE_KEY = "multimodal_rag_state";
 const AUTH_TOKEN_KEY = "multimodal_rag_token";
@@ -36,8 +44,6 @@ const getSessionDisplayTitle = (session) => {
   }
   return session?.title || session?.name || createDefaultSessionTitle();
 };
-
-const api = axios.create({ baseURL: "http://127.0.0.1:8000/api" });
 
 function App() {
   const [user, setUser] = useState(() => {
@@ -71,34 +77,31 @@ function App() {
   const [videoSourceType, setVideoSourceType] = useState("upload");
   const [sessionName, setSessionName] = useState("");
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-
-  const getSessionVideoUrl = (sessionId) =>
-    token
-      ? `http://127.0.0.1:8000/api/sessions/${sessionId}/video?token=${encodeURIComponent(
-          token,
-        )}`
-      : `http://127.0.0.1:8000/api/sessions/${sessionId}/video`;
-
-  // State to control Login Modal Popup
   const [showAuthModal, setShowAuthModal] = useState(false);
 
-  // Set Auth Header whenever token changes
+  const chatEndRef = useRef(null);
+
+  // Scroll to bottom when chat updates
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chat]);
+
+  // Sync token header and localStorage
   useEffect(() => {
     if (token) {
-      api.defaults.headers.common["Authorization"] = `Bearer ${token}`;
+      setAuthToken(token);
       window.localStorage.setItem(AUTH_TOKEN_KEY, token);
     } else {
-      delete api.defaults.headers.common["Authorization"];
+      setAuthToken(null);
       window.localStorage.removeItem(AUTH_TOKEN_KEY);
     }
   }, [token]);
 
-  // Load sessions when authenticated user is present
+  // Load sessions on login
   useEffect(() => {
     if (user && token) {
       loadSessions();
     } else {
-      // Clear or show demo state for unauthenticated viewers
       setSessions([]);
       setChat([]);
     }
@@ -122,19 +125,13 @@ function App() {
   const handleGoogleSuccess = async (credentialResponse) => {
     setLoading(true);
     try {
-      const response = await axios.post(
-        "http://127.0.0.1:8000/api/auth/google",
-        {
-          google_token: credentialResponse.credential,
-        },
-      );
-
-      const { access_token, user: loggedInUser } = response.data;
+      const data = await loginWithGoogle(credentialResponse.credential);
+      const { access_token, user: loggedInUser } = data;
 
       setToken(access_token);
       setUser(loggedInUser);
       window.localStorage.setItem(AUTH_USER_KEY, JSON.stringify(loggedInUser));
-      setShowAuthModal(false); // Close login modal after successful auth
+      setShowAuthModal(false);
     } catch (error) {
       console.error("Google authentication failed:", error);
       alert("Authentication failed. Please check backend logs.");
@@ -158,11 +155,7 @@ function App() {
 
   const loadSessions = async () => {
     try {
-      const response = await api.get("/sessions");
-      const fetchedSessions = Array.isArray(response.data)
-        ? response.data
-        : response.data?.sessions || [];
-
+      const fetchedSessions = await fetchSessions();
       setSessions(fetchedSessions);
 
       if (fetchedSessions.length > 0) {
@@ -175,39 +168,21 @@ function App() {
           (s) => (s.id || s._id || s.session_id) === savedId,
         );
 
-        if (matchedSession) {
-          const targetId =
-            matchedSession.id ||
-            matchedSession._id ||
-            matchedSession.session_id;
-          setActiveSessionId(targetId);
-          setChat(matchedSession.messages || []);
-          setVideoSourceType(matchedSession.source_type || "upload");
-          setVideoUrl(
-            matchedSession.source_type === "youtube"
-              ? matchedSession.source_url || ""
-              : matchedSession.video_path
-                ? getSessionVideoUrl(targetId)
-                : matchedSession.source_url || "",
-          );
-          setSessionName(getSessionDisplayTitle(matchedSession));
-        } else {
-          const firstSession = fetchedSessions[0];
-          const firstId =
-            firstSession.id || firstSession._id || firstSession.session_id;
+        const targetSession = matchedSession || fetchedSessions[0];
+        const targetId =
+          targetSession.id || targetSession._id || targetSession.session_id;
 
-          setActiveSessionId(firstId);
-          setChat(firstSession.messages || []);
-          setVideoSourceType(firstSession.source_type || "upload");
-          setVideoUrl(
-            firstSession.source_type === "youtube"
-              ? firstSession.source_url || ""
-              : firstSession.video_path
-                ? getSessionVideoUrl(firstId)
-                : firstSession.source_url || "",
-          );
-          setSessionName(getSessionDisplayTitle(firstSession));
-        }
+        setActiveSessionId(targetId);
+        setChat(targetSession.messages || []);
+        setVideoSourceType(targetSession.source_type || "upload");
+        setVideoUrl(
+          targetSession.source_type === "youtube"
+            ? targetSession.source_url || ""
+            : targetSession.video_path
+              ? getSessionVideoUrl(targetId, token)
+              : targetSession.source_url || "",
+        );
+        setSessionName(getSessionDisplayTitle(targetSession));
       }
     } catch (error) {
       console.error("Failed to load sessions:", error);
@@ -217,7 +192,6 @@ function App() {
     }
   };
 
-  // Interceptor: Guards actions that require login
   const requireAuth = (actionCallback) => {
     if (!user || !token) {
       setShowAuthModal(true);
@@ -230,15 +204,8 @@ function App() {
     requireAuth(async () => {
       setLoading(true);
       try {
-        const formData = new FormData();
         const defaultTitle = createDefaultSessionTitle();
-        formData.append("title", defaultTitle);
-
-        const response = await api.post("/sessions", formData, {
-          headers: { "Content-Type": "multipart/form-data" },
-        });
-
-        const newSession = response.data;
+        const newSession = await createSession({ title: defaultTitle });
         const newId = newSession.id || newSession._id || newSession.session_id;
 
         setSessions((prev) => [newSession, ...prev]);
@@ -251,7 +218,7 @@ function App() {
         setSessionName(defaultTitle);
         setMessage("");
       } catch (error) {
-        console.error(error);
+        console.error("Error creating session:", error);
       } finally {
         setLoading(false);
       }
@@ -264,15 +231,11 @@ function App() {
       if (!videoFile && !youtubeUrl.trim()) return;
 
       setLoading(true);
-      const formData = new FormData();
-      if (videoFile) formData.append("file", videoFile);
-      if (youtubeUrl.trim()) formData.append("youtube_url", youtubeUrl.trim());
-
       try {
-        const response = await api.post("/sessions", formData, {
-          headers: { "Content-Type": "multipart/form-data" },
+        const nextSession = await createSession({
+          file: videoFile,
+          youtubeUrl: youtubeUrl.trim(),
         });
-        const nextSession = response.data;
         const nextId =
           nextSession.id || nextSession._id || nextSession.session_id;
 
@@ -284,14 +247,14 @@ function App() {
           setVideoUrl(nextSession.source_url || "");
           setVideoSourceType("youtube");
         } else if (videoFile) {
-          setVideoUrl(getSessionVideoUrl(nextId));
+          setVideoUrl(getSessionVideoUrl(nextId, token));
           setVideoSourceType("upload");
         }
 
         setYoutubeUrl("");
         setSessionName(getSessionDisplayTitle(nextSession));
       } catch (error) {
-        console.error(error);
+        console.error("Error uploading video:", error);
       } finally {
         setLoading(false);
       }
@@ -312,24 +275,18 @@ function App() {
       setSessions((prev) =>
         prev.map((s) => {
           const sId = s.id || s._id || s.session_id;
-          if (sId === activeSessionId) {
-            return { ...s, messages: updatedChat };
-          }
-          return s;
+          return sId === activeSessionId ? { ...s, messages: updatedChat } : s;
         }),
       );
 
       try {
-        const response = await api.post(
-          `/sessions/${activeSessionId}/messages`,
-          { question },
-        );
+        const data = await sendMessage(activeSessionId, question);
 
         const fullChat = [
           ...updatedChat,
           {
             role: "assistant",
-            content: response.data.answer || response.data.content,
+            content: data.answer || data.content,
           },
         ];
 
@@ -338,14 +295,11 @@ function App() {
         setSessions((prev) =>
           prev.map((s) => {
             const sId = s.id || s._id || s.session_id;
-            if (sId === activeSessionId) {
-              return { ...s, messages: fullChat };
-            }
-            return s;
+            return sId === activeSessionId ? { ...s, messages: fullChat } : s;
           }),
         );
       } catch (error) {
-        console.error(error);
+        console.error("Error sending message:", error);
         setChat((prev) => [
           ...prev,
           {
@@ -444,7 +398,7 @@ function App() {
                         session.source_type === "youtube"
                           ? session.source_url || ""
                           : session.video_path
-                            ? getSessionVideoUrl(sessionId)
+                            ? getSessionVideoUrl(sessionId, token)
                             : session.source_url || "",
                       );
                       setSessionName(sessionTitle);
@@ -486,16 +440,11 @@ function App() {
       <main className="relative z-10 flex-1 flex flex-col h-full overflow-hidden p-6 gap-6 max-w-7xl mx-auto w-full">
         <header className="flex items-center justify-between">
           <div>
-            {/* <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-xs font-semibold uppercase tracking-wider mb-2">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              Multimodal RAG Live
-            </div> */}
             <h1 className="text-3xl font-extrabold tracking-tight text-white sm:text-4xl">
               Video Q&A <span className="text-emerald-400">Center</span>
             </h1>
           </div>
 
-          {/* User Profile or Sign In CTA */}
           {user ? (
             <div className="flex items-center gap-3 bg-slate-900/80 border border-slate-800 px-3 py-1.5 rounded-2xl">
               {user.picture && (
@@ -638,6 +587,8 @@ function App() {
                   </div>
                 ))
               )}
+              {/* Scroll anchor target */}
+              <div ref={chatEndRef} />
             </div>
 
             <form
