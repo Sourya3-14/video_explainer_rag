@@ -11,7 +11,7 @@ from pymongo import ASCENDING
 
 from app.database import get_db
 from app.models import ChatMessageRequest, SessionCreateRequest
-from app.services.llm_service import answer_question, process_video
+from app.services.llm_service import answer_question, process_video, index_video
 
 DB = get_db()
 
@@ -152,6 +152,11 @@ def upload_video_and_create_session(
 
     processed = process_video(str(video_path), upload_dir)
 
+    index_video(
+        transcript=processed["transcript"],
+        frame_paths=processed["frame_paths"],
+        session_id=session_id,
+    )
     update_payload = {
         "video_metadata": processed["metadata"],
         "video_frames": processed["frame_paths"],
@@ -189,7 +194,15 @@ def ask_question(session_id: str, payload: ChatMessageRequest, user_id: str) -> 
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    answer = answer_question(question, transcript, metadata, session_id, frame_paths)
+    # answer = answer_question(question, transcript, metadata, session_id, frame_paths)
+    answer = answer_question(
+        question=question,
+        context=transcript,
+        metadata=metadata,
+        session_id=session_id,
+        frame_paths=frame_paths,
+        history=session.get("messages", []),
+    )
 
     now_iso = datetime.now(timezone.utc).isoformat()
     message_entry = {"role": "user", "content": question, "timestamp": now_iso}
@@ -197,11 +210,16 @@ def ask_question(session_id: str, payload: ChatMessageRequest, user_id: str) -> 
 
     DB.chat_sessions.update_one(
         {"_id": ObjectId(session_id)},
-        {"$push": {"messages": {"$each": [message_entry, response_entry]}}},
-    )
-    DB.chat_sessions.update_one(
-        {"_id": ObjectId(session_id)},
-        {"$set": {"last_updated": datetime.now(timezone.utc)}},
+        {
+            "$push": {
+                "messages": {
+                    "$each": [message_entry, response_entry]
+                }
+            },
+            "$set": {
+                "last_updated": datetime.now(timezone.utc)
+            }
+        }
     )
 
     return {

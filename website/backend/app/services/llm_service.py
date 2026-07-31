@@ -14,9 +14,14 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 
 
-from llama_index.core import StorageContext, VectorStoreIndex
-from llama_index.core.schema import Document
-from llama_index.vector_stores.lancedb import LanceDBVectorStore
+# from llama_index.core import StorageContext, VectorStoreIndex
+# from llama_index.core.schema import Document
+# from llama_index.vector_stores.lancedb import LanceDBVectorStore
+
+import lancedb
+from sentence_transformers import SentenceTransformer
+
+embedding_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
 
 
 def extract_video_metadata(video_path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -49,22 +54,6 @@ def extract_audio(video_path: str | os.PathLike[str], output_audio_path: Path) -
     clip.audio.write_audiofile(str(output_audio_path), codec="pcm_s16le")
     clip.close()
     return str(output_audio_path)
-
-
-# def transcribe_audio(audio_path: str | os.PathLike[str]) -> str:
-#     if not os.path.exists(audio_path):
-#         return ""
-
-#     recognizer = sr.Recognizer()
-#     try:
-#         with sr.AudioFile(str(audio_path)) as source:
-#             audio_data = recognizer.record(source)
-#             try:
-#                 return recognizer.recognize_whisper(audio_data)
-#             except Exception:
-#                 return ""
-#     except Exception:
-#         return ""
 
 def transcribe_audio(audio_path):
     recognizer = sr.Recognizer()
@@ -101,67 +90,146 @@ def process_video(video_path: str | os.PathLike[str], session_dir: Path) -> dict
         "audio_path": extracted_audio_path,
     }
 
+def index_video(
+    transcript: str,
+    frame_paths: list[str],
+    session_id: str,
+) -> None:
 
-def build_retrieval_context(question: str, transcript: str, frame_paths: list[str], session_id: str) -> str:
     if not transcript and not frame_paths:
-        return ""
+        return
 
-    if StorageContext is None or VectorStoreIndex is None or Document is None or LanceDBVectorStore is None:
-        return transcript[:4000] if transcript else ""
+    cleaned = " ".join(transcript.split())
 
-    cleaned_transcript = " ".join(transcript.split())
-    chunks = []
-    if cleaned_transcript:
-        chunks.extend(
-            chunk.strip()
-            for chunk in re.split(r"(?<=[.!?])\s+", cleaned_transcript)
-            if chunk.strip()
-        )
+    chunks = [
+        chunk.strip()
+        for chunk in re.split(r"(?<=[.!?])\s+", cleaned)
+        if chunk.strip()
+    ]
 
-    documents = [Document(text=chunk, metadata={"source": "transcript"}) for chunk in chunks[:8]]
-    for frame_path in frame_paths[:4]:
-        documents.append(
-            Document(text=f"Visual frame from the video: {Path(frame_path).name}", metadata={"source": "image"})
-        )
+    chunks = chunks[:8]
 
-    if not documents:
-        return ""
+    for frame in frame_paths[:4]:
+        chunks.append(f"Visual frame from video: {Path(frame).name}")
 
-    vector_dir = Path(__file__).resolve().parents[2] / "vector_store" / session_id
-    vector_dir.mkdir(parents=True, exist_ok=True)
+    db_path = Path(__file__).resolve().parents[2] / "vector_store"
+    db_path.mkdir(parents=True, exist_ok=True)
 
-    vector_store = LanceDBVectorStore(uri=str(vector_dir), table_name=f"session_{session_id}")
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    db = lancedb.connect(str(db_path))
 
-    embed_model = None
+    table_name = "video_chunks"
+
+    embeddings = embedding_model.encode(chunks).tolist()
+
+    data = [
+        {
+            "session_id": session_id,
+            "text": text,
+            "vector": vector,
+        }
+        for text, vector in zip(chunks, embeddings)
+    ]
+
     try:
-        from llama_index.embeddings.clip import ClipEmbedding
-        embed_model = ClipEmbedding(model_name="ViT-B/32")
+        table = db.open_table(table_name)
+
+        # Remove old chunks for this session if re-uploading
+        table.delete(f"session_id = '{session_id}'")
+
     except Exception:
-        try:
-            from llama_index.core.embeddings.mock_embed_model import MockEmbedding
-            embed_model = MockEmbedding(embed_dim=384)
-        except Exception:
-            embed_model = None
+        table = db.create_table(table_name, data=data)
+        return
 
-    index = (
-        VectorStoreIndex.from_documents(documents, storage_context=storage_context, embed_model=embed_model)
-        if embed_model is not None
-        else VectorStoreIndex.from_documents(documents, storage_context=storage_context)
+    table.add(data)
+
+def build_retrieval_context(
+    question: str,
+    session_id: str,
+) -> str:
+
+    db_path = Path(__file__).resolve().parents[2] / "vector_store"
+
+    db = lancedb.connect(str(db_path))
+
+    table = db.open_table("video_chunks")
+
+    query_embedding = embedding_model.encode(question).tolist()
+
+    results = (
+        table.search(query_embedding)
+        .where(f"session_id = '{session_id}'")
+        .limit(3)
+        .to_list()
     )
-    retriever = index.as_retriever(similarity_top_k=3)
-    retrieval_results = retriever.retrieve(question)
-    return "\n".join(node.get_text() for node in retrieval_results if hasattr(node, "get_text"))
 
+    return "\n".join(row["text"] for row in results)
 
+def build_search_query(
+    question: str,
+    history_text: str,
+) -> str:
+
+    if not history_text:
+        return question
+
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=GOOGLE_API_KEY)
+
+        model = genai.GenerativeModel("gemini-2.5-flash")
+
+        prompt = f"""
+            Given the conversation history and the latest user question,
+            rewrite the latest question into a standalone search query.
+
+            Conversation:
+            {history_text}
+
+            Latest Question:
+            {question}
+
+            Return ONLY the rewritten question.
+            """
+
+        response = model.generate_content(prompt)
+
+        return response.text.strip()
+
+    except Exception:
+        return question
+    
 def answer_question(
     question: str,
     context: str,
     metadata: dict[str, Any],
     session_id: str | None = None,
     frame_paths: list[str] | None = None,
+    history: list[dict] | None = None,
 ) -> str:
-    retrieval_context = build_retrieval_context(question, context, frame_paths or [], session_id or "default")
+    history_text = ""
+
+    if history:
+        # Keep only the last 8 messages
+        recent_history = history[-8:]
+
+        for message in recent_history:
+            role = message.get("role", "user").capitalize()
+            content = message.get("content", "").strip()
+
+            if content:
+                history_text += f"{role}: {content}\n"
+
+    search_query = build_search_query(
+        question,
+        history_text,
+    )
+
+    retrieval_context = build_retrieval_context(
+        search_query,
+        session_id or "default",
+    )
+    # retrieval_context = build_retrieval_context(question, context, frame_paths or [], session_id or "default")
     answer_context = retrieval_context or context
 
     try:
@@ -169,15 +237,40 @@ def answer_question(
 
         genai.configure(api_key=GOOGLE_API_KEY)
         model = genai.GenerativeModel("gemini-2.5-flash")
-        prompt = (                
-            "You are answering from the uploaded video context only. "
-            f"Video metadata: {metadata}.\n"
-            f"Retrieved context: {answer_context[:6000]}\n"
-            f"Question: {question}\n"
-            "Answer concisely and accurately."
-        )
+        prompt = f"""
+            You are an AI assistant answering questions about an uploaded educational video.
+
+            Conversation History:
+            {history_text}
+
+            Video Metadata:
+            {metadata}
+
+            Retrieved Context:
+            {answer_context}
+
+            Current Question:
+            {question}
+
+            Instructions:
+            - If the user asks about the conversation itself (for example:
+                "What was my previous question?",
+                "What did you just say?",
+                "Repeat your last answer"),
+                answer ONLY from the conversation history.
+            - Otherwise Use the retrieved context as the primary source.
+            - Use the conversation history to understand references.
+            - Do not invent facts not supported by the retrieved context.
+            - Explain concepts in simple language.
+            - Use bullet points where helpful.
+            - Explain technical terms.
+            - If the answer is unavailable from the retrieved context,clearly say so.
+            - Answer the query proeprly even if it is unrelated to the context
+        """
+
         response = model.generate_content(prompt)
         return response.text.strip()
+    
     except Exception:
         pass
 
